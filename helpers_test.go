@@ -254,3 +254,43 @@ func TestAttributesFromDSN(t *testing.T) {
 		})
 	}
 }
+
+//nolint:gosec
+func TestParseDbName(t *testing.T) {
+	testCases := []struct {
+		dsn      string
+		expected string
+	}{
+		// Standard URL-style DSNs
+		{dsn: "mysql://root:pass@example.com/db", expected: "db"},
+		{dsn: "mysql://root:pass@tcp(example.com)/db?parseTime=true", expected: "db"},
+		{dsn: "postgres://root:secret@0.0.0.0:42/db?param1=value1", expected: "db"},
+		{dsn: "unknown://user:pass@dbhost/db", expected: "db"},
+
+		// No scheme
+		{dsn: "root:secret@/db?parseTime=true", expected: "db"},
+		{dsn: "example.com/db", expected: "db"},
+		{dsn: "root:secret@tcp(mysql)/db?parseTime=true", expected: "db"},
+
+		// Empty or missing db name
+		{dsn: "example.com:3307", expected: ""},
+		{dsn: "postgres://user:pass@dbhost/", expected: ""},
+		{dsn: "sqlserver://user:pass@dbhost", expected: ""},
+
+		// sqlserver: database from query param
+		{dsn: "sqlserver://user:pass@dbhost:1433?database=db", expected: "db"},
+		{dsn: "sqlserver://user:pass@dbhost/SQLEXPRESS?database=db", expected: "db"},
+		{dsn: "sqlserver://dbhost:1433?database=db", expected: "db"},
+
+		// sqlserver: no database query param
+		{dsn: "sqlserver://user:pass@dbhost/SQLEXPRESS", expected: ""},
+		{dsn: "sqlserver://user:pass@dbhost:1433", expected: ""},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.dsn, func(t *testing.T) {
+			got := parseDbName(tc.dsn)
+			assert.Equal(t, tc.expected, got)
+		})
+	}
+}

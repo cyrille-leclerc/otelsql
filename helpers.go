@@ -47,6 +47,54 @@ func AttributesFromDSN(dsn string) []attribute.KeyValue {
 	return attrs
 }
 
+// parseDbName extracts the database name from a DSN string.
+// It handles the format: [scheme://][user[:password]@][protocol([addr])][/dbOrInstanceName][?param1=value1&paramN=valueN]
+// Returns an empty string if the database name is not found.
+func parseDbName(dsn string) string {
+
+	// [scheme://][user[:password]@][protocol([addr])][/dbOrInstanceName][?param1=value1&paramN=valueN]
+	// Find the schema part.
+	var scheme string
+	schemaIndex := strings.Index(dsn, "://")
+	if schemaIndex != -1 {
+		scheme = dsn[:schemaIndex]
+		// Remove the schema part from the DSN.
+		dsn = dsn[schemaIndex+3:]
+	}
+
+	// [user[:password]@][protocol([addr])][/dbOrInstanceName][?param1=value1&paramN=valueN]
+	// Find credentials part.
+	if atIndex := strings.Index(dsn, "@"); atIndex != -1 {
+		// Remove the credential part from the DSN.
+		dsn = dsn[atIndex+1:]
+	}
+
+	// [protocol([addr])][/dbOrInstanceName][?param1=value1&paramN=valueN]
+	// Find the '?' that separates the query string.
+	var queryString string
+	if questionMarkIndex := strings.Index(dsn, "?"); questionMarkIndex != -1 {
+		queryString = dsn[questionMarkIndex+1:]
+		// Remove queryString part from the DSN
+		dsn = dsn[:questionMarkIndex]
+	}
+
+	// [protocol([addr])][/dbOrInstanceName]
+	// Find the '/' that separates the address part from the path (database or instance name).
+	pathIndex := strings.Index(dsn, "/")
+	var path string
+	if pathIndex != -1 {
+		path = dsn[pathIndex+1:]
+	}
+
+	if scheme == "sqlserver" {
+		if params, err := url.ParseQuery(queryString); err == nil {
+			return params.Get("database")
+		}
+		return ""
+	}
+	return path
+}
+
 // parseDSN parses a DSN string and returns the server address, server port, and database name.
 // It handles the format: [scheme://][user[:password]@][protocol([addr])][/dbOrInstanceName][?param1=value1&paramN=valueN]
 // serverAddress and dbName are empty strings if not found. serverPort is -1 if not found.

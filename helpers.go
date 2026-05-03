@@ -16,6 +16,7 @@ package otelsql
 
 import (
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -24,62 +25,122 @@ import (
 )
 
 // AttributesFromDSN returns attributes extracted from a DSN string.
-// It makes the best effort to retrieve values for [semconv.ServerAddressKey] and [semconv.ServerPortKey].
+// It makes the best effort to retrieve values for
+// [semconv.ServerAddressKey], [semconv.ServerPortKey], and [semconv.DBNamespaceKey].
 func AttributesFromDSN(dsn string) []attribute.KeyValue {
-	addr := addrFromDSN(dsn)
-	if addr == "" {
-		return nil
+	serverAddress, serverPort, dbName := parseDSN(dsn)
+
+	var attrs []attribute.KeyValue
+
+	if serverAddress != "" {
+		attrs = append(attrs, semconv.ServerAddress(serverAddress))
 	}
 
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
+	if serverPort != -1 {
+		attrs = append(attrs, semconv.ServerPortKey.Int64(serverPort))
 	}
 
-	attrs := make([]attribute.KeyValue, 0, 2)
-	if host != "" {
-		attrs = append(attrs, semconv.ServerAddress(host))
-	}
-
-	if portStr != "" {
-		if port, err := strconv.ParseInt(portStr, 10, 64); err == nil {
-			attrs = append(attrs, semconv.ServerPortKey.Int64(port))
-		}
+	if dbName != "" {
+		attrs = append(attrs, semconv.DBNamespace(dbName))
 	}
 
 	return attrs
 }
 
-// addrFromDSN extracts the network address (host[:port] or unix-socket path)
-// from a DSN string, stripping any scheme, credentials, protocol wrapper,
-// and trailing dbname/query components.
-func addrFromDSN(dsn string) string {
-	// [scheme://][user[:password]@][protocol([addr])]/dbname[?param1=value1&paramN=valueN]
-	// Strip scheme.
-	if i := strings.Index(dsn, "://"); i != -1 {
-		dsn = dsn[i+3:]
+// parseDSN parses a DSN string and returns the server address, server port, and database name.
+// It handles the format: [scheme://][user[:password]@][protocol([addr])][/path][?param1=value1&paramN=valueN]
+// serverAddress and dbName are empty strings if not found. serverPort is -1 if not found.
+func parseDSN(dsn string) (serverAddress string, serverPort int64, dbName string) {
+	// [scheme://][user[:password]@][protocol([addr])][/path][?param1=value1&paramN=valueN]
+	var scheme string
+
+	if schemaIndex := strings.Index(dsn, "://"); schemaIndex != -1 {
+		scheme = dsn[:schemaIndex]
+		dsn = dsn[schemaIndex+3:]
 	}
 
-	// Strip credentials.
-	if i := strings.Index(dsn, "@"); i != -1 {
-		dsn = dsn[i+1:]
+	// [user[:password]@][protocol([addr])][/path][?param1=value1&paramN=valueN]
+	if atIndex := strings.Index(dsn, "@"); atIndex != -1 {
+		dsn = dsn[atIndex+1:]
 	}
 
-	// If the DSN uses the protocol(addr) form, extract addr from between
-	// the parens first. Splitting on '/' up front would break on addresses
-	// like unix(/tmp/mysql.sock), which contain a '/' inside the parens
-	// and used to trigger an out-of-range slice panic (#624).
-	openParen := strings.Index(dsn, "(")
-
-	closeParen := strings.Index(dsn, ")")
-	if openParen != -1 && closeParen > openParen {
-		return dsn[openParen+1 : closeParen]
+	// [protocol([addr])][/path][?param1=value1&paramN=valueN]
+	var queryString string
+	if questionMarkIndex := strings.Index(dsn, "?"); questionMarkIndex != -1 {
+		queryString = dsn[questionMarkIndex+1:]
+		dsn = dsn[:questionMarkIndex]
 	}
 
-	// Bare address form: addr/db?params. Trim the path suffix.
-	if i := strings.Index(dsn, "/"); i != -1 {
-		return dsn[:i]
+	// [protocol([addr])][/path]
+	// When the DSN uses protocol(addr) form, split on the '/' after the closing paren
+	// to avoid treating the address inside unix(/tmp/mysql.sock) as part of the path.
+	var path string
+
+	if openParen := strings.Index(dsn, "("); openParen != -1 {
+		if closeParen := strings.Index(dsn, ")"); closeParen > openParen {
+			remaining := dsn[closeParen+1:]
+			if slashIdx := strings.Index(remaining, "/"); slashIdx != -1 {
+				path = remaining[slashIdx+1:]
+			}
+		}
+		// dsn retains the full protocol(addr)[/path] fragment; parseHostPort strips the wrapper.
+	} else if pathIndex := strings.Index(dsn, "/"); pathIndex != -1 {
+		path = dsn[pathIndex+1:]
+		dsn = dsn[:pathIndex]
 	}
 
-	return dsn
+	serverAddress, serverPort = parseHostPort(dsn)
+	dbName = parseDbName(scheme, path, queryString)
+
+	return serverAddress, serverPort, dbName
+}
+
+// parseDbName extracts the database name from a DSN scheme, path, and query string.
+// Returns an empty string for unknown schemes or when the database name is not present.
+func parseDbName(scheme, path, queryString string) string {
+	switch scheme {
+	case "sqlserver", "mssql":
+		// sqlserver uses the "database" query param; the path is the instance name, not the database.
+		if params, err := url.ParseQuery(queryString); err == nil {
+			return params.Get("database")
+		}
+	case "postgresql", "postgres", "mysql", "clickhouse":
+		return path
+	}
+
+	return ""
+}
+
+// parseHostPort extracts the server address and port from a DSN fragment.
+// It handles MySQL's protocol(addr) syntax where the address is wrapped in parentheses.
+// serverAddress is an empty string if not found; serverPort is -1 if not found.
+func parseHostPort(dsn string) (serverAddress string, serverPort int64) {
+	serverPort = -1
+
+	// Strip MySQL's protocol(addr) wrapper, e.g. "tcp(host:3306)" → "host:3306".
+	if openParen := strings.Index(dsn, "("); openParen != -1 {
+		rest := dsn[openParen+1:]
+		if closeParen := strings.Index(rest, ")"); closeParen != -1 {
+			rest = rest[:closeParen]
+		}
+
+		dsn = rest
+	}
+
+	if len(dsn) == 0 {
+		return
+	}
+
+	host, portStr, err := net.SplitHostPort(dsn)
+	if err != nil {
+		return dsn, serverPort
+	}
+
+	serverAddress = host
+
+	if port, err := strconv.ParseInt(portStr, 10, 64); err == nil {
+		serverPort = port
+	}
+
+	return
 }
